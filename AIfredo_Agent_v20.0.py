@@ -103,8 +103,7 @@ class AgentMemory:
         "스피커": {"location": "거실", "actions": ["비상 알람 울리기", "음성 안내"]},
         "정책": {"location": "시스템", "actions": ["원격 인덕션 켜기 방지 설정", "보안 강화"]},
         "주치의": {"location": "외부 병원", "actions": ["상담 예약", "데이터 전송"]},
-        "사용자": {"location": "집", "actions": ["알림 전송", "상태 확인"]},
-        "보호자": {"location": "외부", "actions": ["알림 전송", "긴급 연락"]},
+        "보호자": {"location": "외부", "actions": ["알림 전송", "상태 확인", "긴급 연락"]},
         "119": {"location": "외부 기관", "actions": ["긴급 신고", "상황 전파"]},
         "알람": {"location": "집안 전체", "actions": ["울리기", "끄기"]}
     }
@@ -183,7 +182,8 @@ class AgentMemory:
 class AgentTools:
     @staticmethod
     def get_medical_opinion(metrics_data: dict) -> str:
-        prompt = f"환자 데이터 분석 결과 요약: {metrics_data}"
+        print_log("Tools", "의학적 소견 요청", "건강 데이터를 바탕으로 Medical AI 분석 중...", "Medical AI")
+        prompt = f"환자 데이터 분석 결과 요약: {metrics_data}\n이 데이터를 바탕으로 의학적 소견을 1-2문장으로 짧게 작성해주세요."
         response = llm.invoke([SystemMessage(content=prompt)])
         return response.content
 
@@ -194,7 +194,7 @@ class SystemAPI:
 
     @staticmethod
     def send_to_doctor(opinion: str) -> str:
-        return f"전송 완료: 주치의에게 데이터 전송"
+        return f"전송 완료: 주치의에게 소견 데이터 전송"
 
     @staticmethod
     def call_emergency(location: str) -> str:
@@ -219,7 +219,7 @@ def router_node(state: AgentState):
     prompt = (
         "사용자 입력을 다음 5가지 인텐트 중 하나로 분류하세요:\n"
         "health_care, home_safety_care, device_control, troubleshooting, emergency_care.\n"
-        "출력은 반드시 {\"intent\": \"분류된인텐트\"} 형태의 JSON 구조로만 작성하세요.\n\n"
+        "출력은 반드시 {\"intent\": \"분류된인텐트\", \"reasoning\": \"판단 근거를 1-2문장으로 명확히 작성\"} 형태의 JSON 구조로만 작성하세요.\n\n"
         f"입력: {user_message}"
     )
     
@@ -227,12 +227,15 @@ def router_node(state: AgentState):
     parsed_text = response.content.strip()
     
     intent = "home_safety_care"
+    reasoning = "기본 룰 기반 분류가 적용되었습니다."
     
     try:
         json_text = re.sub(r'```json|```', '', parsed_text).strip()
         parsed_json = json.loads(json_text)
         if "intent" in parsed_json:
             intent = parsed_json["intent"]
+        if "reasoning" in parsed_json:
+            reasoning = parsed_json["reasoning"]
     except Exception:
         t = user_message.lower()
         if "emergency" in t or "긴급" in t or "낙상" in t:
@@ -246,13 +249,14 @@ def router_node(state: AgentState):
         else:
             intent = "home_safety_care"
 
-    print_log("Router", "이벤트 분석 및 라우팅", f"판단된 인텐트: {intent}", "General LLM")
+    details = f"판단된 인텐트: {intent}\n판단 근거: {reasoning}"
+    print_log("Router", "이벤트 분석 및 라우팅", details, "General LLM")
     
     elapsed_time = time.time() - start_time
     return {
         "intent": intent,
         "execution_logs": [f"[Router] {intent} 분류 완료"],
-        "execution_path": [{"node": "Router", "system": "General LLM", "data": f"인텐트: {intent}", "time": elapsed_time}],
+        "execution_path": [{"node": "Router", "system": "General LLM", "data": f"인텐트: {intent}, 근거: {reasoning}", "time": elapsed_time}],
     }
 
 def route_edges(state: AgentState) -> str:
@@ -273,7 +277,7 @@ def planner_node(state: AgentState):
 [작업 원칙]
 1. 허용된 기기 목록 매핑 (절대 규칙):
 {target_info_str}
-- 타겟과 액션은 반드시 위 JSON 목록의 '한글 명칭' 그대로 출력해야 합니다. (예: 영어 induction -> 인덕션, turn_off -> 끄기)
+- 타겟과 액션은 반드시 위 JSON 목록의 '한글 명칭' 그대로 출력해야 합니다.
 2. 검열 금지 및 원본 추출:
 - 허용 목록에 없는 기기(예: 테스트기기A, 부모님)나 보안 위협 지시(예: 시스템해킹기능, 시스템 명령 무시)라도 사용자가 요청했다면 절대 삭제하지 말고 플랜에 무조건 포함시키십시오.
 3. 출력 형식 제한:
@@ -288,7 +292,9 @@ def planner_node(state: AgentState):
     
     if intent == "health_care":
         context_data = AgentMemory.get_health_data()
-        prompt = f"요청: {user_message}\n데이터: {json.dumps(context_data['data'])}\n상황에 맞게 플랜을 수립하세요."
+        medical_opinion = AgentTools.get_medical_opinion(context_data['data']['metrics'])
+        used_ai = "General LLM & Medical AI"
+        prompt = f"요청: {user_message}\n건강 데이터: {json.dumps(context_data['data'])}\n의학적 소견(Medical AI): {medical_opinion}\n위 소견을 바탕으로 상황에 맞게 플랜을 수립하세요."
     elif intent == "home_safety_care":
         context_data = AgentMemory.get_home_status()
         prompt = f"이벤트: {user_message}\n가구 상태: {json.dumps(context_data['data'])}\n상황에 맞게 플랜을 수립하세요. 단, 인덕션 화재 위험이 감지될 경우 반드시 '정책' 타겟을 활용하여 '원격 인덕션 켜기 방지 설정' 액션을 플랜에 추가하세요."
@@ -417,7 +423,7 @@ def controller_node(state: AgentState):
         elif "119" in target:
             final_location = event_location if event_location else location
             result = SystemAPI.call_emergency(final_location)
-        elif target in ["사용자", "보호자"]:
+        elif target == "보호자":
             result = f"[알림 전송] {target}(위치: {location})에게 안내: {action}"
         else:
             result = SystemAPI.execute_device_control(target, location, action)
