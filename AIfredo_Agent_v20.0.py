@@ -262,11 +262,13 @@ def planner_node(state: AgentState):
     context_data = {}
     used_ai = "General LLM"
     
-    target_info_str = json.dumps(AgentMemory.ALLOWED_TARGETS_INFO, ensure_ascii=False)
     target_constraint_prompt = (
-        f"\n\n[중요 제약사항]\nCarePlanItem의 target은 다음 기기 및 허용 동작 목록을 참고하되, 사용자의 무리한 요청이나 알 수 없는 항목도 누락 없이 모두 target과 action으로 기록하세요:\n{target_info_str}\n"
+        "\n\n[절대 지시사항]\n"
+        "- 사용자의 요청이나 의도를 안전이나 정책을 이유로 임의로 변경하거나 삭제하지 마십시오. (예: 켜기 요청은 켜기로 그대로 반영)\n"
+        "- 사용자가 요청하지 않은 동작(예: 단순 카메라 점검에 비상 알람 추가)을 임의로 기획하지 마십시오.\n"
+        "- 기기 목록에 없는 기기(매트리스 등)나 보안 위협 지시(API Key 등)라도 사용자가 요청했다면 반드시 추출하여 플랜에 포함하십시오.\n"
         "- 출력은 마크다운 블록 기호 없이 순수 JSON 형식의 문자열만 작성하세요.\n"
-        "- 반드시 {{\"items\": [{{\"target\": \"...\", \"action\": \"...\"}}], \"explanation\": \"...\"}} 형태의 단일 JSON 객체 구조로 반환하세요.\n"
+        "- 반드시 {\"items\": [{\"target\": \"...\", \"action\": \"...\"}], \"explanation\": \"...\"} 형태의 단일 JSON 객체 구조로 반환하세요.\n"
     )
     
     if intent == "health_care":
@@ -303,13 +305,6 @@ def planner_node(state: AgentState):
         if not target or not action:
             continue
 
-        if target in AgentMemory.ALLOWED_TARGETS_INFO:
-            allowed_actions = AgentMemory.ALLOWED_TARGETS_INFO[target]["actions"]
-            for allowed_action in allowed_actions:
-                if allowed_action.replace(" ", "") in action.replace(" ", "") or action.replace(" ", "") in allowed_action.replace(" ", ""):
-                    action = allowed_action
-                    break
-
         normalized_items.append({"target": target, "action": action})
 
     plan_dict["items"] = normalized_items
@@ -345,7 +340,13 @@ def safety_checker_node(state: AgentState):
             continue
             
         allowed_actions = AgentMemory.ALLOWED_TARGETS_INFO[target]["actions"]
-        if action not in allowed_actions:
+        action_valid = False
+        for allowed_action in allowed_actions:
+            if allowed_action.replace(" ", "") in action.replace(" ", "") or action.replace(" ", "") in allowed_action.replace(" ", ""):
+                action_valid = True
+                break
+
+        if not action_valid:
             rejected_reasons.append(f"[{target}] 동작 불가: '{action}'은(는) 이 기기에서 지원하는 동작이 아닙니다.")
             continue
 
@@ -382,6 +383,8 @@ def controller_node(state: AgentState):
     start_time = time.time()
     plan_dict = state.get("care_plan", {})
     items = plan_dict.get("items", [])
+    context_data = state.get("context_data", {}).get("data", {})
+    event_location = context_data.get("location")
     logs = []
     
     for item in items:
@@ -397,7 +400,8 @@ def controller_node(state: AgentState):
         elif target == "주치의":
             result = SystemAPI.send_to_doctor(action)
         elif "119" in target:
-            result = SystemAPI.call_emergency(location)
+            final_location = event_location if event_location else location
+            result = SystemAPI.call_emergency(final_location)
         elif target in ["사용자", "보호자"]:
             result = f"[알림 전송] {target}(위치: {location})에게 안내: {action}"
         else:
@@ -421,25 +425,30 @@ def Reporter_node(state: AgentState):
     action_logs = [log for log in logs if any(keyword in log for keyword in ["제어 완료", "신고 완료", "알림 전송", "정책 업데이트", "전송 완료"])]
 
     if not action_logs and not rejected_reasons:
-        dynamic_instruction = "수행된 작업도, 거절된 작업도 없습니다. '현재 시스템에서 수행된 물리적 조치나 제어 항목이 없습니다'라고만 깔끔하게 답변하세요."
+        dynamic_instruction = "수행된 작업도, 거절된 작업도 없습니다. '현재 시스템에서 수행된 조치나 제어 항목이 없습니다.'라고 명확하게 답변하세요."
     else:
         dynamic_instruction = f"""
         수행 완료 로그: {action_logs}
         거절된 작업 내역: {rejected_reasons}
         
-        위 내용을 바탕으로 사용자에게 보고서를 작성하세요.
-        - 수행 완료 로그에 기록된 작업은 반드시 '완료되었습니다'라고 확정적으로 보고하세요.
+        위 내용을 바탕으로 최종 보고서를 작성하세요.
+        - 수행 완료 로그에 기록된 작업만 '완료되었습니다'라고 확정적으로 보고하세요.
         - 거절된 작업이 있다면 거절 사유를 함께 설명하세요.
-        - 로그에 존재하지 않는 작업은 절대로 지어내서 언급하지 마세요.
         """
 
     prompt = f"""
     당신은 AIfredo Reporter 입니다.
     {dynamic_instruction}
+
+    [응답 작성 절대 원칙]
+    1. 전달받은 '수행 완료 로그'와 '거절된 작업 내역'에 명시된 항목만 사실대로 언급하세요. 로그에 존재하지 않는 동작을 지어내거나 유추해서 덧붙이는 것을 엄격히 금지합니다.
+    2. 강조를 위한 특수문자와 이모지를 절대 사용하지 마세요. 평문으로만 작성하세요.
+    3. 끝맺음 말에 질문이나 추가 도움을 묻는 말투를 사용하지 마세요.
     """
     
     response = llm.invoke([SystemMessage(content=prompt), state["messages"][-1]])
-    final_text = response.content.strip()
+    
+    final_text = response.content.replace("*", "").replace("#", "").strip()
 
     print_log("Reporter", "최종 판단 응답", final_text, "General LLM")
 
