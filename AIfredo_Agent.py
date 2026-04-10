@@ -5,6 +5,8 @@ import re
 import time
 import sys
 import pandas as pd
+import openpyxl
+from openpyxl.styles import Alignment
 from datetime import datetime
 from typing import TypedDict, Annotated
 from langchain_openai import ChatOpenAI
@@ -14,13 +16,42 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+'''
+[AIfredo Release Notes]
+v21.0: 
+- 엑셀 파일명에 버전(VERSION) 및 사용된 모델 요약 추가
+- 데이터 피벗 적용 및 연속 세션 테스트 로직 도입
+
+v21.1:
+- 엑셀 저장 구조 원복 (시나리오를 1열로, 모델별 결과를 우측 열로 나열)
+- 불필요한 피벗(pivot) 및 전치(T) 로직 제거
+
+v21.2:
+- 코드 상단에 누적형 릴리즈 노트(Changelog) 주석 추가
+
+v21.3:
+- 엑셀 저장 구조 재수정 (1행에 시나리오 가로 나열, 행 단위로 모델 결과 세로 누적)
+
+v21.4:
+- 엑셀 구조 완전 재설계 (멀티 시트 도입: '전체 종합', '로그')
+- 1행 시나리오 고정, 1열 컴포넌트별 세부 소요시간 및 액션/승인/거절/완료 개수 등 세부 메트릭 추가
+
+v21.5:
+- 엑셀 내 '로그' 시트의 모든 데이터에 자동 줄바꿈(Wrap Text) 속성 및 상단 정렬 적용
+
+v21.6:
+- 선형적 Autocompact 제거 및 '모션필로우(Motion Pillow)' 백그라운드 자율 메모리 노드 도입
+- MEMORY.md (경량 인덱스)와 개별 토픽(Topic)으로 분리된 3단 메모리 아키텍처 적용
+'''
+VERSION = "21.6"
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 TARGET_MODELS = [
-    # "qwen/qwen3-235b-a22b",
-    # "deepseek/deepseek-r1",
+    "qwen/qwen3-235b-a22b",
+    "deepseek/deepseek-r1",
     "openai/gpt-4o",
-    # "google/gemini-2.5-flash-lite"
+    "google/gemini-2.5-flash-lite"
 ]
 
 def get_openrouter_llm(model_name: str, temperature: float = 0.0, max_tokens: int = None):
@@ -132,7 +163,9 @@ class AgentMemory:
                     "BLOCK_REMOTE_MICROWAVE": True
                 },
                 "anomaly_reports": [],
-                "induction_issue_active": True
+                "induction_issue_active": True,
+                "memory_index": "기록 없음",
+                "memory_topics": {}
             }
         return cls._sessions[user_id]
 
@@ -144,7 +177,9 @@ class AgentMemory:
                 "BLOCK_REMOTE_MICROWAVE": True
             },
             "anomaly_reports": [],
-            "induction_issue_active": True
+            "induction_issue_active": True,
+            "memory_index": "기록 없음",
+            "memory_topics": {}
         }
 
     @classmethod
@@ -437,18 +472,15 @@ def safety_checker_node(state: AgentState):
         action_str = str(action).strip()
         ko_target = AgentMemory.TARGET_KO_MAP.get(target_str, target_str)
         
-        # [단계 1] 위험 패턴 탐지 (Risk Pattern Detection - bashSecurity.ts 역할)
         if any(keyword in action_str.lower() or keyword in target_str.lower() for keyword in ["api", "key", "무시", "해킹", "시스템"]):
             if target_str != "Policy":
                 rejected_reasons.append(f"[{ko_target}] 단계1 차단(위험 패턴): 시스템 권한 탈취 또는 지시 무시 시도가 탐지되었습니다.")
                 continue
 
-        # [단계 2] 기기 권한 및 등록 확인 (Permissions Check - bashPermissions.ts 역할)
         if target_str not in AgentMemory.ALLOWED_TARGETS_INFO:
             rejected_reasons.append(f"[{ko_target}] 단계2 차단(권한 오류): 시스템 연동 및 제어 권한이 없는 미등록 객체입니다.")
             continue
             
-        # [단계 3] 동작 스코프 및 읽기전용 검증 (Action Scope Validation - readOnlyValidation/pathValidation.ts 역할)
         allowed_actions = AgentMemory.ALLOWED_TARGETS_INFO[target_str]["actions"]
         action_valid = False
         for allowed_action in allowed_actions:
@@ -463,13 +495,11 @@ def safety_checker_node(state: AgentState):
             approved_items.append(item)
             continue
 
-        # [단계 4] 고위험 특수 기기 별도 검증 (Critical Device Validation - sedValidation.ts 역할)
         if target_str == "Induction" and ("켜" in action_str or "작동" in action_str):
             if AgentMemory.get_policy(user_id, "BLOCK_REMOTE_INDUCTION"):
                 rejected_reasons.append(f"[{ko_target}] 단계4 차단(정책 충돌): 화재 방지 정책에 의해 원격 점화가 하드웨어적으로 잠겨있습니다.")
                 continue
                 
-        # [단계 5] 샌드박스 안전 실행 승인 (Safe Execution Approval - shouldUseSandbox.ts 역할)
         approved_items.append(item)
         
     plan_dict["items"] = approved_items
@@ -604,8 +634,9 @@ def Reporter_node(state: AgentState):
         "execution_path": [{"node": "Reporter", "system": f"LLM ({model_name})", "data": "최종 텍스트 응답 생성 완료", "time": elapsed_time}]
     }
 
-def compactor_node(state: AgentState):
+def motion_pillow_node(state: AgentState):
     start_time = time.time()
+    user_id = state.get("user_id")
     messages = state.get("messages", [])
     model_name = state["current_model"]
     
@@ -617,31 +648,53 @@ def compactor_node(state: AgentState):
         
         history_text = "\n".join([f"{'User' if isinstance(m, HumanMessage) else 'System'}: {m.content}" for m in old_messages])
         
-        prompt = f"당신은 AIfredo의 메모리 관리자입니다.\n아래 과거 대화 기록의 핵심 정보(사용자 상태, 발생했던 문제, 조치 완료 사항)를 1~2문장으로 요약하세요. 이 요약본은 다음 턴의 시스템 메모리로 활용됩니다.\n\n[과거 대화 기록]\n{history_text}"
+        prompt = f"""당신은 사용자가 자리를 비운 사이 백그라운드에서 기억을 정리하는 '모션필로우(Motion Pillow)' 자율 에이전트입니다.
+컨텍스트 엔트로피(정보 꼬임)를 막기 위해 과거 대화를 분석하여 핵심 주제(Topic)를 추출하고 요약하세요.
+반드시 아래 JSON 포맷으로 출력하세요.
+{{"topic": "주제명(예: 건강상태, 기기제어, 보안이슈)", "summary": "해당 주제에 대한 1~2문장 요약"}}
+
+[과거 대화 기록]
+{history_text}"""
         
         try:
             summary_res = temp_llm.invoke([SystemMessage(content=prompt)])
-            summary_text = summary_res.content.replace("*", "").strip()
-        except Exception as e:
-            summary_text = "이전 대화 요약 실패"
+            parsed_text = summary_res.content.strip()
+            json_text = re.sub(r'```json|```', '', parsed_text).strip()
+            parsed_json = json.loads(json_text)
             
-        compressed_msg = SystemMessage(content=f"[Autocompact Memory 과거 요약본]: {summary_text}")
+            topic = parsed_json.get("topic", "기타")
+            summary = parsed_json.get("summary", "요약 내용 없음")
+        except Exception as e:
+            topic = "시스템_복구"
+            summary = "이전 대화 요약 실패 및 단순 압축 진행"
+            
+        session = AgentMemory._get_session(user_id)
+        if topic not in session["memory_topics"]:
+            session["memory_topics"][topic] = []
+        session["memory_topics"][topic].append(summary)
+        
+        index_lines = ["# MEMORY.md (경량 인덱스)"]
+        for t, contents in session["memory_topics"].items():
+            index_lines.append(f"- [{t}] 관련 기록 {len(contents)}건 존재")
+        session["memory_index"] = "\n".join(index_lines)
+        
+        compressed_msg = SystemMessage(content=f"[모션필로우 백그라운드 정리 완료]\n{session['memory_index']}\n최근 요약: {summary}")
         
         new_messages = [compressed_msg] + recent_messages
-        log_msg = f"컨텍스트 최적화 완료 (이전 메시지 {len(old_messages)}개 -> 1개로 압축)"
+        log_msg = f"컨텍스트 최적화 완료 (주제: {topic} / 이전 메시지 {len(old_messages)}개 압축)"
         
         elapsed_time = time.time() - start_time
-        print_log("Compactor", "오래된 State 메모리 자동 압축", log_msg + f"\n요약 내용: {summary_text}", f"LLM ({model_name})")
+        print_log("Motion Pillow", "3단 아키텍처 기반 백그라운드 메모리 정리", log_msg + f"\n요약: {summary}", f"Autonomous Agent ({model_name})")
         
         return {
             "messages": new_messages,
-            "execution_logs": [f"[Compactor] {log_msg}"],
-            "execution_path": [{"node": "Compactor", "system": f"LLM ({model_name})", "data": f"{log_msg}\n{summary_text}", "time": elapsed_time}]
+            "execution_logs": [f"[Motion Pillow] {log_msg}"],
+            "execution_path": [{"node": "Motion Pillow", "system": f"Agent ({model_name})", "data": f"{log_msg}\n{summary}", "time": elapsed_time}]
         }
     
     return {
-        "execution_logs": ["[Compactor] 압축 기준 미달로 유지"],
-        "execution_path": [{"node": "Compactor", "system": "Rule", "data": "메모리 유지", "time": 0.0}]
+        "execution_logs": ["[Motion Pillow] 정리 기준 미달로 대기"],
+        "execution_path": [{"node": "Motion Pillow", "system": "Rule", "data": "메모리 유지 (대기)", "time": 0.0}]
     }
 
 def build_app():
@@ -651,7 +704,7 @@ def build_app():
     workflow.add_node("safety_checker", safety_checker_node)
     workflow.add_node("controller", controller_node)
     workflow.add_node("Reporter", Reporter_node)
-    workflow.add_node("compactor", compactor_node)
+    workflow.add_node("Motion Pillow", motion_pillow_node)
 
     workflow.set_entry_point("router")
     workflow.add_edge("router", "planner")
@@ -661,8 +714,8 @@ def build_app():
         "Reporter": "Reporter"
     })
     workflow.add_edge("controller", "Reporter")
-    workflow.add_edge("Reporter", "compactor")
-    workflow.add_edge("compactor", END)
+    workflow.add_edge("Reporter", "Motion Pillow")
+    workflow.add_edge("Motion Pillow", END)
     
     return workflow.compile()
 
@@ -697,15 +750,14 @@ scenarios = [
     }
 ]
 
-excel_data_dict = {}
-for scene in scenarios:
-    excel_data_dict[scene['desc']] = {"시나리오": scene['desc']}
+results_db = {}
 
 for model in VALID_TARGET_MODELS:
     user_id = f"user_{model.split('/')[-1].replace('.', '_')}"
     AgentMemory.reset_session(user_id)
-    
     current_chat_history = []
+    
+    results_db[model] = {}
     
     print("\n\n" + "=" * 80)
     print(f" >>> 모델 [{model}] 연속 세션 테스트 시작 (User ID: {user_id})")
@@ -727,42 +779,50 @@ for model in VALID_TARGET_MODELS:
             "current_model": model
         }
         
+        d = {
+            "total_time": 0.0, "router_time": 0.0, "planner_time": 0.0, 
+            "safety_time": 0.0, "controller_time": 0.0, "reporter_time": 0.0, "motion_pillow_time": 0.0,
+            "plan_count": 0, "approved_count": 0, "rejected_count": 0, "unmet_count": 0, "executed_count": 0,
+            "pipeline_log": "", "final_response": ""
+        }
+        
         try:
             final_state = app.invoke(inputs)
-            
             current_chat_history = final_state["messages"]
-            final_response = final_state["messages"][-1].content
             
-            total_time = sum([p.get('time', 0.0) for p in final_state['execution_path']])
             pipeline_nodes = []
-            plan_count = 0
-            approved_count = 0
-            rejected_count = 0
             
             for p in final_state['execution_path']:
                 node = p['node']
-                data = p.get('data', '')
-                time_spent = p.get('time', 0.0)
+                data = str(p.get('data', ''))
+                time_spent = round(p.get('time', 0.0), 1)
                 
-                pipeline_nodes.append(f"[{node} ({time_spent:.1f}s)]\n{data}")
-                
-                if node == "Planner":
+                if node == "Router": d["router_time"] = time_spent
+                elif node == "Planner": 
+                    d["planner_time"] = time_spent
                     match = re.search(r'계획 추출 액션: (\d+)건', data)
+                    if match: d["plan_count"] = int(match.group(1))
+                elif node == "Safety Checker": 
+                    d["safety_time"] = time_spent
+                    match = re.search(r'승인 (\d+)건, 거절 (\d+)건, 기기 부재 미수행 (\d+)건', data)
                     if match:
-                        plan_count = int(match.group(1))
-                
-                elif node == "Safety Checker":
-                    match = re.search(r'승인 (\d+)건, 거절 (\d+)건', data)
-                    if match:
-                        approved_count = int(match.group(1))
-                        rejected_count = int(match.group(2))
-            
-            excel_data_dict[desc][f"[{model}] 파이프라인 경로"] = "\n\n↓\n\n".join(pipeline_nodes)
-            excel_data_dict[desc][f"[{model}] 기획(Plan) 건수"] = plan_count
-            excel_data_dict[desc][f"[{model}] 승인(Approve) 건수"] = approved_count
-            excel_data_dict[desc][f"[{model}] 거절(Reject) 건수"] = rejected_count
-            excel_data_dict[desc][f"[{model}] 총 소요시간(초)"] = round(total_time, 1)
-            excel_data_dict[desc][f"[{model}] 최종 응답"] = final_response
+                        d["approved_count"] = int(match.group(1))
+                        d["rejected_count"] = int(match.group(2))
+                        d["unmet_count"] = int(match.group(3))
+                elif node == "Controller":
+                    d["controller_time"] = time_spent
+                    match = re.search(r'명령 수행 (\d+)건', data)
+                    if match: d["executed_count"] = int(match.group(1))
+                elif node == "Reporter":
+                    d["reporter_time"] = time_spent
+                elif node == "Motion Pillow":
+                    d["motion_pillow_time"] = time_spent
+                    
+                pipeline_nodes.append(f"[{node} ({time_spent:.1f}s)]\n{data}")
+
+            d["total_time"] = round(sum([p.get('time', 0.0) for p in final_state['execution_path']]), 1)
+            d["pipeline_log"] = "\n\n↓\n\n".join(pipeline_nodes)
+            d["final_response"] = final_state["messages"][-1].content
             
             print("\n[시나리오 파이프라인 흐름도 요약]")
             for i, p in enumerate(final_state['execution_path']):
@@ -774,21 +834,67 @@ for model in VALID_TARGET_MODELS:
                         print(f"   │ {line}")
                 if i < len(final_state['execution_path']) - 1:
                     print("   ▼")
-            print(f"   (총 파이프라인 소요 시간: {total_time:.1f}초)")
+            print(f"   (총 파이프라인 소요 시간: {d['total_time']}초)")
             print("-" * 80)
             
         except Exception as e:
             error_msg = f"API 또는 런타임 오류 발생: {str(e)}"
             print(error_msg)
-            excel_data_dict[desc][f"[{model}] 파이프라인 경로"] = "에러"
-            excel_data_dict[desc][f"[{model}] 기획(Plan) 건수"] = 0
-            excel_data_dict[desc][f"[{model}] 승인(Approve) 건수"] = 0
-            excel_data_dict[desc][f"[{model}] 거절(Reject) 건수"] = 0
-            excel_data_dict[desc][f"[{model}] 총 소요시간(초)"] = 0.0
-            excel_data_dict[desc][f"[{model}] 최종 응답"] = error_msg
+            d["pipeline_log"] = "에러 발생"
+            d["final_response"] = error_msg
+            
+        results_db[model][desc] = d
 
-excel_data = list(excel_data_dict.values())
-df = pd.DataFrame(excel_data)
+sheet1_data = []
+sheet2_data = []
+
+for model in VALID_TARGET_MODELS:
+    row_total = {"측정 항목 / 모델": f"[{model}] 총 소요시간(초)"}
+    row_router = {"측정 항목 / 모델": f"[{model}] Router 소요시간(초)"}
+    row_planner = {"측정 항목 / 모델": f"[{model}] Planner 소요시간(초)"}
+    row_safety = {"측정 항목 / 모델": f"[{model}] Safety Checker 소요시간(초)"}
+    row_controller = {"측정 항목 / 모델": f"[{model}] Controller 소요시간(초)"}
+    row_reporter = {"측정 항목 / 모델": f"[{model}] Reporter 소요시간(초)"}
+    row_motion_pillow = {"측정 항목 / 모델": f"[{model}] Motion Pillow 소요시간(초)"}
+    row_plan_cnt = {"측정 항목 / 모델": f"[{model}] Planner 추출 액션(건)"}
+    row_appr_cnt = {"측정 항목 / 모델": f"[{model}] Safety Checker 승인(건)"}
+    row_rej_cnt = {"측정 항목 / 모델": f"[{model}] Safety Checker 거절(건)"}
+    row_unmet_cnt = {"측정 항목 / 모델": f"[{model}] 기기 부재 미수행(건)"}
+    row_exec_cnt = {"측정 항목 / 모델": f"[{model}] Controller 제어 완료(건)"}
+    
+    row_pipe_log = {"측정 항목 / 모델": f"[{model}] 파이프라인 전체 로그"}
+    row_final_res = {"측정 항목 / 모델": f"[{model}] 최종 응답 (Reporter)"}
+
+    for scene in scenarios:
+        desc = scene['desc']
+        d = results_db[model][desc]
+        
+        row_total[desc] = d["total_time"]
+        row_router[desc] = d["router_time"]
+        row_planner[desc] = d["planner_time"]
+        row_safety[desc] = d["safety_time"]
+        row_controller[desc] = d["controller_time"]
+        row_reporter[desc] = d["reporter_time"]
+        row_motion_pillow[desc] = d["motion_pillow_time"]
+        row_plan_cnt[desc] = d["plan_count"]
+        row_appr_cnt[desc] = d["approved_count"]
+        row_rej_cnt[desc] = d["rejected_count"]
+        row_unmet_cnt[desc] = d["unmet_count"]
+        row_exec_cnt[desc] = d["executed_count"]
+        
+        row_pipe_log[desc] = d["pipeline_log"]
+        row_final_res[desc] = d["final_response"]
+        
+    sheet1_data.extend([
+        row_total, row_router, row_planner, row_safety, row_controller, 
+        row_reporter, row_motion_pillow, row_plan_cnt, row_appr_cnt, 
+        row_rej_cnt, row_unmet_cnt, row_exec_cnt
+    ])
+    
+    sheet2_data.extend([row_pipe_log, row_final_res])
+
+df_sheet1 = pd.DataFrame(sheet1_data)
+df_sheet2 = pd.DataFrame(sheet2_data)
 
 providers = []
 active_models = [m for m in TARGET_MODELS if not m.strip().startswith("#")]
@@ -799,9 +905,19 @@ for m in active_models:
 model_summary = ",".join(providers)
 
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-excel_filename = f"results_{model_summary}_{timestamp}.xlsx"
+excel_filename = f"results_{VERSION}_{timestamp}_{model_summary}.xlsx"
 
-# 피벗 및 전치 없이 시나리오를 1열로 직접 저장
-df.to_excel(excel_filename, index=False)
+with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+    df_sheet1.to_excel(writer, sheet_name='전체 종합', index=False)
+    df_sheet2.to_excel(writer, sheet_name='로그', index=False)
+    
+    worksheet = writer.sheets['로그']
+    
+    for col in worksheet.columns:
+        worksheet.column_dimensions[col[0].column_letter].width = 60
+        
+    for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row, min_col=1, max_col=worksheet.max_column):
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical='top')
 
-print(f"\n[모든 시나리오 연속 세션 테스트 완료. '{excel_filename}'에 결과가 저장되었습니다.]")
+print(f"\n[모든 시나리오 매트릭스 엑셀 추출 완료. '{excel_filename}'에 저장되었습니다.]")
